@@ -1,0 +1,5 @@
+# Codigo e doc em LF, para o arquivo ficar igual no Windows, no Linux e no GitHub.
+*.sql text eol=lf
+*.ts  text eol=lf
+*.tsx text eol=lf
+*.md  text eol=lf
