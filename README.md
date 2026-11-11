@@ -12,7 +12,7 @@ espalhados em repositórios separados nesta conta.
   clique, dez decisões de engenharia com o bug que cada uma evita, e um guia de
   implementação do zero. **Stack:** PostgreSQL · TanStack Start · React 19 ·
   TypeScript · Supabase.
-- [autom8-lab — três automações no n8n](autom8-lab/) — laboratório de introdução ao n8n: webhook que recebe lead, monitor agendado com alerta no Telegram e API de frete com enriquecimento por CEP. Workflows exportados, passo a passo e glossário.
+- [n8n-automacoes-basicas — três automações básicas no n8n](n8n-automacoes-basicas/) — laboratório de introdução ao n8n: webhook que recebe lead, monitor agendado com alerta no Telegram e API de frete com enriquecimento por CEP. Workflows exportados, passo a passo e glossário.
 - [Python — cinco projetos de estudo](python/) — programas pequenos de terminal, só com a biblioteca padrão: jogo da velha, jogo da forca, agenda em JSON, controle de gastos em CSV e gerador de senha. Um README por projeto, com o que foi treinado nele e por que cada decisão foi tomada.
 
 ## Formação

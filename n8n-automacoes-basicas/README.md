@@ -1,4 +1,4 @@
-# autom8-lab
+# n8n-automacoes-basicas
 
 **Três automações no n8n, do zero até o webhook respondendo.**
 
@@ -66,7 +66,7 @@ Todo projeto tem a mesma estrutura, e o `workflow.json` é importável direto:
 ## Estrutura
 
 ```
-autom8-lab/
+n8n-automacoes-basicas/
 ├── README.md                     ← você está aqui
 ├── GLOSSARIO.md                  ← toda palavra difícil, em uma linha
 ├── docs/
