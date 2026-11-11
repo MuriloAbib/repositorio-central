@@ -1,4 +1,4 @@
-# Automação de Atendimento
+# Automação de Atendimento (Sorvebot)
 
 **Motor de atendimento e vendas no WhatsApp que responde a maior parte das mensagens sem chamar
 um LLM — e que trata "quando chamar o modelo" como uma decisão de engenharia, não de prompt.**
