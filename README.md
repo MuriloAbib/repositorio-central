@@ -5,6 +5,7 @@ espalhados em repositórios separados nesta conta.
 
 ## Desenvolvimento
 
+- [Automação de Atendimento](automacao-de-atendimento/) — motor de atendimento e vendas no WhatsApp que responde a maior parte das mensagens **sem chamar LLM**: cascata de quatro camadas (guardas em código, memória destilada, busca local por palavras-chave e funil determinístico), com o modelo como último recurso. Arquitetura, decisões de engenharia, guardas de segurança da conversa e suíte de 683 testes. Python/FastAPI/PostgreSQL + React.
 - [Automação de rodízio de número de WhatsApp](automacao-rodizio-whatsapp/) —
   distribuição automática e justa de leads entre vários consultores de vendas,
   com contador global atômico no PostgreSQL. Código **de produção** extraído e
