@@ -1,0 +1,615 @@
+{
+  "name": "01 - Pagamento e provisionamento",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pagamento/:gateway",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000001",
+      "name": "Webhook pagamento",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-600, 0],
+      "webhookId": "1a9d0001-0001-4a01-8a01-0000000000a1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n// require de modulo nativo no Code node exige NODE_FUNCTION_ALLOW_BUILTIN=crypto na\n// instancia. Falhar aqui, na borda, e melhor que aceitar webhook sem conferir assinatura:\n// pagamento forjado provisiona barbearia de graca.\n\nconst entrada = $input.first();\n\n// Header em minusculas: HTTP/2 entrega minuscula, HTTP/1.1 entrega como o remetente\n// escreveu, e 'X-Signature' !== 'x-signature' num objeto JS.\nconst cab = {};\nfor (const [chave, valor] of Object.entries(entrada.json.headers || {})) {\n  cab[chave.toLowerCase()] = Array.isArray(valor) ? valor[0] : valor;\n}\n\nconst gateway = String((entrada.json.params || {}).gateway || '').toLowerCase();\n\n// Os bytes exatos que chegaram, nao o objeto reserializado: JSON.stringify(JSON.parse(x))\n// difere de x em ordem de chave, espaco e escape unicode, e um byte de diferenca derruba o\n// HMAC. Vem do option rawBody do Webhook, que guarda o corpo cru em binary.data.\nconst bruto = ((entrada.binary || {}).data || {}).data;\nconst cru = bruto === undefined ? null : Buffer.from(bruto, 'base64').toString('utf8');\nconst corpo = cru === null ? (entrada.json.body || {}) : JSON.parse(cru);\n\nfunction segredoDoAmbiente(nome) {\n  const valor = $env[nome];\n  if (!valor) throw new Error('variavel de ambiente ausente: ' + nome);\n  return valor;\n}\n\nfunction iguais(a, b) {\n  // Tempo constante: com === a comparacao para no primeiro byte diferente e o tempo da\n  // resposta revela o prefixo correto, o que permite descobrir a assinatura byte a byte.\n  // O sha256 dos dois lados iguala o tamanho, que timingSafeEqual exige.\n  const da = crypto.createHash('sha256').update(String(a), 'utf8').digest();\n  const db = crypto.createHash('sha256').update(String(b), 'utf8').digest();\n  return crypto.timingSafeEqual(da, db);\n}\n\nfunction hmacHex(segredo, texto) {\n  return crypto.createHmac('sha256', segredo).update(texto, 'utf8').digest('hex');\n}\n\n// 'ts=1700000000,v1=abc' -> { ts: ['...'], v1: ['...'] }. Lista por chave porque a Stripe\n// manda mais de um v1 durante rotacao de segredo.\nfunction camposDoHeader(valor) {\n  const campos = {};\n  for (const parte of String(valor || '').split(',')) {\n    const corte = parte.indexOf('=');\n    if (corte <= 0) continue;\n    const chave = parte.slice(0, corte).trim();\n    if (campos[chave] === undefined) campos[chave] = [];\n    campos[chave].push(parte.slice(corte + 1).trim());\n  }\n  return campos;\n}\n\nlet evento_externo_id;\nlet recurso_id;\nlet tipo_externo;\n\nif (gateway === 'mercadopago') {\n  const campos = camposDoHeader(cab['x-signature']);\n  const ts = (campos.ts || [])[0];\n  const v1 = (campos.v1 || [])[0];\n  if (!ts || !v1) throw new Error('mercadopago: x-signature ausente ou fora do formato ts=...,v1=...');\n\n  recurso_id = String((corpo.data || {}).id || '');\n  if (!recurso_id) throw new Error('mercadopago: corpo sem data.id');\n\n  // Manifest posicional e literal, com ';' tambem no FIM e id alfanumerico em minusculas.\n  // Tirar o ultimo ';', trocar a ordem dos campos ou omitir request-id que veio gera outro\n  // HMAC e reprova assinatura valida.\n  const manifest = 'id:' + recurso_id.toLowerCase() + ';request-id:' + (cab['x-request-id'] || '') + ';ts:' + ts + ';';\n  if (!iguais(hmacHex(segredoDoAmbiente('MERCADOPAGO_WEBHOOK_SECRET'), manifest), v1)) {\n    throw new Error('mercadopago: assinatura invalida');\n  }\n\n  // data.id e NAO corpo.id: corpo.id e o id da notificacao e muda a cada reentrega, o que\n  // faria o dedupe de webhooks_recebidos aceitar o mesmo pagamento mais de uma vez.\n  evento_externo_id = 'payment:' + recurso_id;\n  tipo_externo = String(corpo.action || corpo.type || 'payment');\n} else if (gateway === 'stripe') {\n  if (cru === null) throw new Error('stripe: corpo cru indisponivel, ligue o option rawBody no Webhook');\n  const campos = camposDoHeader(cab['stripe-signature']);\n  const t = (campos.t || [])[0];\n  const assinaturas = campos.v1 || [];\n  if (!t || assinaturas.length === 0) throw new Error('stripe: Stripe-Signature ausente ou fora do formato t=...,v1=...');\n\n  // Tolerancia de 300s. Sem ela a requisicao capturada vale para sempre: o que expira e o\n  // timestamp, o HMAC continua correto.\n  const idade = Math.abs(Math.floor(Date.now() / 1000) - Number(t));\n  if (!Number.isFinite(idade) || idade > 300) throw new Error('stripe: timestamp fora da tolerancia de 300s');\n\n  const esperado = hmacHex(segredoDoAmbiente('STRIPE_WEBHOOK_SECRET'), t + '.' + cru);\n  // Mais de um v1 e rotacao de segredo em curso: basta um casar.\n  if (!assinaturas.some(function (a) { return iguais(esperado, a); })) throw new Error('stripe: assinatura invalida');\n\n  recurso_id = String(corpo.id || '');\n  if (!recurso_id) throw new Error('stripe: corpo sem id do evento');\n  evento_externo_id = recurso_id;\n  tipo_externo = String(corpo.type || '');\n} else if (gateway === 'asaas') {\n  // O Asaas nao assina o corpo: manda no header o token configurado no painel dele. A\n  // comparacao em tempo constante continua valendo, porque token descoberto byte a byte\n  // tambem provisiona barbearia de graca.\n  if (!iguais(cab['asaas-access-token'] || '', segredoDoAmbiente('ASAAS_WEBHOOK_TOKEN'))) {\n    throw new Error('asaas: token de webhook invalido');\n  }\n\n  recurso_id = String((corpo.payment || {}).id || '');\n  if (!recurso_id) throw new Error('asaas: corpo sem payment.id');\n  tipo_externo = String(corpo.event || '');\n  // corpo.id existe nas versoes novas do webhook. Sem ele, evento+pagamento mantem a chave\n  // unica por tipo de evento: so com o pagamento, PAYMENT_RECEIVED seria descartado como\n  // reentrega de PAYMENT_CONFIRMED do mesmo pagamento.\n  evento_externo_id = corpo.id ? String(corpo.id) : tipo_externo + ':' + recurso_id;\n} else {\n  // O Switch seguinte roteia por este campo e nao tem saida de fallback: quem barra path\n  // desconhecido e esta linha.\n  throw new Error('gateway nao suportado no path: ' + gateway);\n}\n\n// Fecha o CHECK de 64 hex de webhooks_recebidos e serve para ver o gateway mandando\n// conteudo diferente sob o mesmo id, sem guardar payload de pagamento no banco.\nconst corpo_hash = crypto.createHash('sha256').update(cru === null ? JSON.stringify(corpo) : cru, 'utf8').digest('hex');\n\n// Sem segredo, sem token e sem corpo de pagamento no item: tudo o que sai daqui fica\n// gravado no log de execucao do n8n.\nreturn [{ json: {\n  gateway: gateway,\n  evento_externo_id: evento_externo_id,\n  recurso_id: recurso_id,\n  tipo_externo: tipo_externo,\n  corpo_hash: corpo_hash\n} }];"
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000002",
+      "name": "Valida assinatura",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-400, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000003",
+      "name": "Responde 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [-200, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Dedupe da borda: a UNIQUE (gateway, evento_externo_id) e o que faz a reentrega do\n-- gateway encerrar sozinha. Com RETURNING, linha de volta significa primeira entrega e\n-- nenhuma linha significa reentrega — por isso o no roda com alwaysOutputData, senao\n-- zero linhas pararia o fluxo sem passar pelo IF e a reentrega ficaria indistinguivel\n-- de uma falha silenciosa.\ninsert into public.webhooks_recebidos (gateway, evento_externo_id, corpo_hash)\nvalues ($1, $2, $3)\non conflict (gateway, evento_externo_id) do nothing\nreturning id, gateway, evento_externo_id",
+        "options": {
+          "queryReplacement": "={{ $json.gateway }},{{ $json.evento_externo_id }},{{ $json.corpo_hash }}"
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000004",
+      "name": "Registra webhook",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [0, 0],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1a9d0002-0001-4a01-8a01-000000000005",
+              "leftValue": "={{ $json.id !== undefined && $json.id !== null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000005",
+      "name": "Primeira entrega?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [200, 0]
+    },
+    {
+      "parameters": {},
+      "id": "1a9d0001-0001-4a01-8a01-000000000006",
+      "name": "Reentrega ignorada",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [400, 180]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1a9d0002-0001-4a01-8a01-000000000071",
+                    "leftValue": "={{ $('Valida assinatura').first().json.gateway }}",
+                    "rightValue": "mercadopago",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "mercadopago"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1a9d0002-0001-4a01-8a01-000000000072",
+                    "leftValue": "={{ $('Valida assinatura').first().json.gateway }}",
+                    "rightValue": "asaas",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "asaas"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1a9d0002-0001-4a01-8a01-000000000073",
+                    "leftValue": "={{ $('Valida assinatura').first().json.gateway }}",
+                    "rightValue": "stripe",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "stripe"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000007",
+      "name": "Qual gateway?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [400, -80]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.mercadopago.com/v1/payments/{{ $('Valida assinatura').first().json.recurso_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MERCADOPAGO_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000008",
+      "name": "Consulta Mercado Pago",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, -300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.asaas.com/v3/payments/{{ $('Valida assinatura').first().json.recurso_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "={{ $env.ASAAS_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000009",
+      "name": "Consulta Asaas",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, -120],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.asaas.com/v3/customers/{{ $json.customer }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "={{ $env.ASAAS_API_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000010",
+      "name": "Consulta cliente Asaas",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [800, -120],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.stripe.com/v1/events/{{ $('Valida assinatura').first().json.recurso_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.STRIPE_SECRET_KEY }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000011",
+      "name": "Consulta Stripe",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [600, 60],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst borda = $('Valida assinatura').first().json;\nconst gateway = borda.gateway;\n\n// O `id` do envelope e a chave de idempotencia da secao 3, entao ele NAO pode ser\n// aleatorio: com randomUUID, a retentativa do no de provisionamento criaria um segundo\n// tenant para o mesmo pagamento. Derivado de (gateway, evento_externo_id), duas execucoes\n// do mesmo webhook produzem o mesmo id.\nfunction uuidDeterministico(semente) {\n  const b = Buffer.from(crypto.createHash('sha256').update(semente, 'utf8').digest().subarray(0, 16));\n  b[6] = (b[6] & 15) | 64;\n  b[8] = (b[8] & 63) | 128;\n  const h = b.toString('hex');\n  return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);\n}\n\n// E.164 sem '+' (secao 2). Numero que nao da para classificar sai null: nono digito nao se\n// adivinha e 10 digitos nao e necessariamente fixo. Telefone remendado manda a senha de\n// primeiro acesso para outra pessoa.\nfunction telefoneE164(valor) {\n  const d = String(valor === null || valor === undefined ? '' : valor).replace(/\\D/g, '');\n  if (d.length >= 12 && d.length <= 15) return d;\n  if (d.length === 10 || d.length === 11) return '55' + d;\n  return null;\n}\n\n// Reais em double para centavos inteiros. 99.9 * 100 da 9989.999999999998: sem o round, o\n// valor gravado fica um centavo abaixo do cobrado.\nfunction centavosDeReais(valor) {\n  const n = Number(valor);\n  return Number.isFinite(n) ? Math.round(n * 100) : null;\n}\n\nfunction cicloNormalizado(valor) {\n  const v = String(valor === null || valor === undefined ? '' : valor).toLowerCase();\n  if (['mensal', 'monthly', 'month', 'months', 'mes'].indexOf(v) >= 0) return 'mensal';\n  if (['anual', 'annual', 'yearly', 'year', 'ano'].indexOf(v) >= 0) return 'anual';\n  return null;\n}\n\nlet aprovado = false;\nlet motivo = null;\nlet pagador = { nome: null, email: null, telefone: null };\nlet plano = null;\nlet valor_centavos = null;\nlet assinatura_externa_id = null;\nlet ciclo = null;\n\n// Cada ramo le o no da propria consulta pelo nome. Referenciar no que nao rodou nesta\n// execucao levanta erro no n8n, e e por isso que a leitura fica dentro do if do gateway em\n// vez de usar $input, que mudaria de forma conforme o ramo.\nif (gateway === 'mercadopago') {\n  const p = $('Consulta Mercado Pago').first().json;\n  const quem = p.payer || {};\n  const fone = quem.phone || {};\n  const meta = p.metadata || {};\n  aprovado = p.status === 'approved';\n  motivo = aprovado ? null : String(p.status_detail || p.status || 'sem status');\n  pagador = {\n    nome: [quem.first_name, quem.last_name].filter(Boolean).join(' ').trim() || null,\n    email: quem.email || null,\n    telefone: telefoneE164(String(fone.area_code || '') + String(fone.number || ''))\n  };\n  plano = meta.plano || meta.plan || null;\n  valor_centavos = centavosDeReais(p.transaction_amount);\n  assinatura_externa_id = String(meta.assinatura_externa_id || meta.preapproval_id || p.id || '');\n  ciclo = cicloNormalizado(meta.ciclo || meta.frequency_type);\n} else if (gateway === 'asaas') {\n  const p = $('Consulta Asaas').first().json;\n  // O payment do Asaas traz so o id do cliente; nome, e-mail e celular do dono vem do\n  // /customers, e sem e-mail nao ha como criar a conta no Auth.\n  const c = $('Consulta cliente Asaas').first().json;\n  aprovado = ['CONFIRMED', 'RECEIVED', 'RECEIVED_IN_CASH'].indexOf(String(p.status || '')) >= 0;\n  motivo = aprovado ? null : String(p.status || 'sem status');\n  pagador = {\n    nome: c.name || null,\n    email: c.email || null,\n    telefone: telefoneE164(c.mobilePhone || c.phone)\n  };\n  plano = p.externalReference || p.description || null;\n  valor_centavos = centavosDeReais(p.value);\n  assinatura_externa_id = String(p.subscription || p.id || '');\n  ciclo = cicloNormalizado(p.cycle);\n} else if (gateway === 'stripe') {\n  const ev = $('Consulta Stripe').first().json;\n  const obj = (ev.data || {}).object || {};\n  const quem = obj.customer_details || {};\n  const meta = obj.metadata || {};\n  aprovado = ['checkout.session.completed', 'invoice.paid', 'invoice.payment_succeeded'].indexOf(String(ev.type)) >= 0\n    && String(obj.payment_status || 'paid') !== 'unpaid';\n  motivo = aprovado ? null : String(ev.type || 'evento nao aprovado');\n  pagador = {\n    nome: quem.name || obj.customer_name || null,\n    email: quem.email || obj.customer_email || null,\n    telefone: telefoneE164(quem.phone)\n  };\n  plano = meta.plano || null;\n  // A Stripe ja manda inteiro na MENOR unidade da moeda. Multiplicar por 100 aqui, como se\n  // faz com Mercado Pago e Asaas, gravaria cem vezes o valor cobrado — e o erro passa por\n  // qualquer validacao de tipo, porque continua sendo inteiro.\n  if (typeof obj.amount_total === 'number') valor_centavos = obj.amount_total;\n  else if (typeof obj.amount_paid === 'number') valor_centavos = obj.amount_paid;\n  else if (typeof obj.amount === 'number') valor_centavos = obj.amount;\n  assinatura_externa_id = String(obj.subscription || obj.id || '');\n  ciclo = cicloNormalizado(meta.ciclo);\n} else {\n  throw new Error('gateway nao suportado: ' + gateway);\n}\n\nconst evento = aprovado ? 'pagamento.confirmado' : 'pagamento.falhou';\n\n// plano nulo NAO vira default: inventar plano e cobrar um valor e entregar outro. Quem\n// recusa e a Edge Function, que conhece o catalogo de precos; a recusa vai para a\n// fila_morta e um humano resolve.\nconst envelope = {\n  evento: evento,\n  versao: 1,\n  id: uuidDeterministico(gateway + ':' + borda.evento_externo_id + ':' + evento),\n  ocorrido_em: new Date().toISOString(),\n  // tenant_id nulo de proposito: no pagamento.confirmado a barbearia ainda nao existe —\n  // cria-la e justamente o trabalho de provisionar-tenant, que devolve o id.\n  tenant_id: null,\n  origem: 'gateway:' + gateway,\n  dados: aprovado\n    ? {\n        gateway: gateway,\n        evento_externo_id: borda.evento_externo_id,\n        pagador: pagador,\n        plano: plano,\n        valor_centavos: valor_centavos,\n        assinatura_externa_id: assinatura_externa_id || null,\n        ciclo: ciclo\n      }\n    : {\n        gateway: gateway,\n        evento_externo_id: borda.evento_externo_id,\n        assinatura_externa_id: assinatura_externa_id || null,\n        motivo: motivo || 'nao aprovado'\n      }\n};\n\nreturn [{ json: {\n  evento: evento,\n  aprovado: aprovado,\n  assinatura_externa_id: assinatura_externa_id || null,\n  motivo: motivo,\n  envelope: envelope\n} }];"
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000012",
+      "name": "Normaliza pagamento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, -120]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1a9d0002-0001-4a01-8a01-000000000013",
+              "leftValue": "={{ $json.aprovado === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000013",
+      "name": "Pagamento aprovado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1200, -120]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst item = $input.first().json;\n\n// Uma serializacao so, e e ela que vai no corpo da requisicao (contentType raw no no\n// seguinte). Se o no de HTTP reserializasse o objeto, o HMAC seria sobre bytes diferentes\n// dos enviados e o backend recusaria toda chamada.\nconst corpo_bruto = JSON.stringify(item.envelope);\n\nconst segredo = $env.SEGREDO_PONTE;\nif (!segredo) throw new Error('variavel de ambiente ausente: SEGREDO_PONTE');\n\n// ts dentro do texto assinado: sem ele a assinatura vale para sempre e a requisicao\n// capturada pode ser reenviada. Quem confere a janela e a Edge Function.\nconst ts = String(Math.floor(Date.now() / 1000));\nconst assinatura = crypto.createHmac('sha256', segredo).update(ts + '.' + corpo_bruto, 'utf8').digest('hex');\n\nreturn [{ json: { evento: item.evento, corpo_bruto: corpo_bruto, ts: ts, assinatura: assinatura } }];"
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000014",
+      "name": "Assina chamada da ponte",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, -260]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/functions/v1/provisionar-tenant",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "x-fastchair-ts",
+              "value": "={{ $json.ts }}"
+            },
+            {
+              "name": "x-fastchair-assinatura",
+              "value": "={{ $json.assinatura }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.corpo_bruto }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000015",
+      "name": "Provisiona tenant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1600, -260],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "update public.webhooks_recebidos\n   set processado_em = now(), resultado = 'provisionado', erro = null\n where gateway = $1 and evento_externo_id = $2 and processado_em is null\nreturning id, processado_em",
+        "options": {
+          "queryReplacement": "={{ $('Valida assinatura').first().json.gateway }},{{ $('Valida assinatura').first().json.evento_externo_id }}"
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000016",
+      "name": "Fecha webhook",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1800, -260],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1a9d0002-0001-4a01-8a01-000000000017",
+              "leftValue": "={{ $runIndex < 2 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000017",
+      "name": "Vale tentar de novo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1800, -60]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": "={{ Math.min(60, 5 * Math.pow(2, $runIndex)) }}",
+        "unit": "seconds"
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000018",
+      "name": "Espera crescente",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [2000, -60],
+      "webhookId": "1a9d0001-0001-4a01-8a01-0000000000b1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Pagamento recusado nao e falha de infraestrutura, entao nao vai para fila_morta: ele\n-- fecha o ciclo do webhook e, se a assinatura ja existir (cobranca recorrente que caiu),\n-- marca inadimplencia. As duas atualizacoes num CTE so porque consulta com parametro nao\n-- aceita mais de um comando.\n-- Ponto de extensao: quando existir funcao de reconciliacao de assinatura no backend, e\n-- ela que recebe o pagamento.falhou; hoje o efeito util do evento e este UPDATE.\nwith fechado as (\n  update public.webhooks_recebidos\n     set processado_em = now(), resultado = 'ignorado', erro = $3\n   where gateway = $1 and evento_externo_id = $2\n  returning id\n), inadimplente as (\n  update public.assinaturas\n     set status = 'inadimplente'\n   where gateway = $1 and assinatura_externa_id = $4 and status <> 'cancelada'\n  returning id\n)\nselect (select count(*) from fechado) as webhooks_fechados,\n       (select count(*) from inadimplente) as assinaturas_marcadas",
+        "options": {
+          "queryReplacement": "={{ $('Valida assinatura').first().json.gateway }},{{ $('Valida assinatura').first().json.evento_externo_id }},{{ $json.motivo || 'nao aprovado' }},{{ $json.assinatura_externa_id }}"
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000019",
+      "name": "Registra pagamento falhou",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1400, 100],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "1a9d0001-0001-4a01-8a01-000000000020",
+      "name": "Fim pagamento falhou",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1600, 100]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into public.fila_morta (origem, evento, payload, erro)\nvalues ($1, $2, $3::jsonb, $4)\nreturning id, criado_em",
+        "options": {
+          "queryReplacement": "={{ 'n8n:01-pagamento-provisionamento' }},{{ $json.evento || 'webhook.pagamento' }},{{ JSON.stringify({ gateway: $('Valida assinatura').first().json.gateway, evento_externo_id: $('Valida assinatura').first().json.evento_externo_id, recurso_id: $('Valida assinatura').first().json.recurso_id, tipo_externo: $('Valida assinatura').first().json.tipo_externo }) }},{{ $json.error == null ? 'falha sem detalhe' : ($json.error.message || $json.error.description || String($json.error)) }}"
+        }
+      },
+      "id": "1a9d0001-0001-4a01-8a01-000000000021",
+      "name": "Fila morta",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [2000, 420],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook pagamento": {
+      "main": [[{ "node": "Valida assinatura", "type": "main", "index": 0 }]]
+    },
+    "Valida assinatura": {
+      "main": [[{ "node": "Responde 200", "type": "main", "index": 0 }]]
+    },
+    "Responde 200": {
+      "main": [[{ "node": "Registra webhook", "type": "main", "index": 0 }]]
+    },
+    "Registra webhook": {
+      "main": [
+        [{ "node": "Primeira entrega?", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Primeira entrega?": {
+      "main": [
+        [{ "node": "Qual gateway?", "type": "main", "index": 0 }],
+        [{ "node": "Reentrega ignorada", "type": "main", "index": 0 }]
+      ]
+    },
+    "Qual gateway?": {
+      "main": [
+        [{ "node": "Consulta Mercado Pago", "type": "main", "index": 0 }],
+        [{ "node": "Consulta Asaas", "type": "main", "index": 0 }],
+        [{ "node": "Consulta Stripe", "type": "main", "index": 0 }]
+      ]
+    },
+    "Consulta Mercado Pago": {
+      "main": [
+        [{ "node": "Normaliza pagamento", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Consulta Asaas": {
+      "main": [
+        [{ "node": "Consulta cliente Asaas", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Consulta cliente Asaas": {
+      "main": [
+        [{ "node": "Normaliza pagamento", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Consulta Stripe": {
+      "main": [
+        [{ "node": "Normaliza pagamento", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normaliza pagamento": {
+      "main": [[{ "node": "Pagamento aprovado?", "type": "main", "index": 0 }]]
+    },
+    "Pagamento aprovado?": {
+      "main": [
+        [{ "node": "Assina chamada da ponte", "type": "main", "index": 0 }],
+        [{ "node": "Registra pagamento falhou", "type": "main", "index": 0 }]
+      ]
+    },
+    "Assina chamada da ponte": {
+      "main": [[{ "node": "Provisiona tenant", "type": "main", "index": 0 }]]
+    },
+    "Provisiona tenant": {
+      "main": [
+        [{ "node": "Fecha webhook", "type": "main", "index": 0 }],
+        [{ "node": "Vale tentar de novo?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Vale tentar de novo?": {
+      "main": [
+        [{ "node": "Espera crescente", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Espera crescente": {
+      "main": [[{ "node": "Provisiona tenant", "type": "main", "index": 0 }]]
+    },
+    "Registra pagamento falhou": {
+      "main": [[{ "node": "Fim pagamento falhou", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {},
+  "staticData": null,
+  "tags": [],
+  "meta": {
+    "instanceId": "fastchair"
+  }
+}

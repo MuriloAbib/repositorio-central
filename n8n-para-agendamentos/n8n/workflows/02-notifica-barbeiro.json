@@ -1,0 +1,238 @@
+{
+  "name": "02 - Agendamento notifica o barbeiro",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "2a000001-0000-4000-8000-000000000001",
+      "name": "A cada minuto",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select * from public.reservar_eventos_saida(20, 120, 6);",
+        "options": {}
+      },
+      "id": "2a000002-0000-4000-8000-000000000002",
+      "name": "Reserva eventos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-400, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "alwaysOutputData": false,
+      "credentials": {
+        "postgres": {
+          "id": "fastchair-postgres",
+          "name": "FastChair Supabase Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        },
+        "batchSize": 1
+      },
+      "id": "2a000003-0000-4000-8000-000000000003",
+      "name": "Um evento por vez",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-200, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Traduz o evento de dominio na mensagem que a pessoa vai ler.\n//\n// Aqui e a BORDA DE APRESENTACAO: e o unico lugar do sistema que converte UTC\n// para o horario local. O banco guarda UTC e o envelope transporta UTC com 'Z'\n// (ver iso_utc em 0011); se a conversao acontecesse antes, o mesmo evento\n// sairia com offset diferente dependendo de quem o emitiu.\n\nconst FUSO = $env.FUSO_PADRAO || 'America/Sao_Paulo';\n\nfunction quando(iso) {\n  const d = new Date(iso);\n  const data = new Intl.DateTimeFormat('pt-BR', {\n    timeZone: FUSO, day: '2-digit', month: '2-digit', weekday: 'short',\n  }).format(d);\n  const hora = new Intl.DateTimeFormat('pt-BR', {\n    timeZone: FUSO, hour: '2-digit', minute: '2-digit', hour12: false,\n  }).format(d);\n  return { data, hora };\n}\n\n// Telefone brasileiro em E.164 sem '+'. Numero de 10 digitos NAO e\n// necessariamente fixo: pode ser celular antigo sem o nono digito. Classifica\n// pelo primeiro digito do numero local antes de mexer — apagar ou inserir\n// digito as cegas perde parte da base.\nfunction e164(bruto) {\n  if (!bruto) return null;\n  let d = String(bruto).replace(/\\D+/g, '');\n  if (d.startsWith('00')) d = d.slice(2);\n  if (d.length >= 12 && d.startsWith('55')) return d;\n  if (d.startsWith('55') && d.length === 11) d = d.slice(2);\n  if (d.length === 11 || d.length === 10) {\n    const local = d.slice(2);\n    const primeiro = local[0];\n    if (local.length === 8 && ['9', '8', '7', '6'].includes(primeiro)) {\n      // celular antigo de 8 digitos: ganha o 9\n      d = d.slice(0, 2) + '9' + local;\n    }\n    return '55' + d;\n  }\n  if (d.length === 13 && d.startsWith('55')) return d;\n  return null;\n}\n\nconst saida = [];\n\nfor (const item of $input.all()) {\n  const ev = item.json;\n  const d = ev.dados || {};\n  const prof = d.profissional || {};\n  const cli = d.cliente || {};\n  const serv = d.servico || {};\n  const loja = d.barbearia || {};\n\n  let template = null;\n  let variaveis = {};\n  let destino = null;\n  let canal = prof.canal === 'email' ? 'email' : 'whatsapp';\n\n  const t = quando(d.inicio_em);\n  const telCliente = e164(cli.telefone);\n  const telProf = e164(prof.telefone);\n\n  if (ev.evento === 'agendamento.criado') {\n    template = 'novo_agendamento_barbeiro';\n    variaveis = {\n      profissional: prof.nome,\n      cliente: cli.nome,\n      servico: serv.nome,\n      data: t.data,\n      hora: t.hora,\n      telefone_cliente: telCliente || 'nao informado',\n      loja: loja.nome,\n    };\n  } else if (ev.evento === 'agendamento.cancelado') {\n    template = 'agendamento_cancelado_barbeiro';\n    variaveis = {\n      profissional: prof.nome, cliente: cli.nome,\n      servico: serv.nome, data: t.data, hora: t.hora,\n    };\n  } else if (ev.evento === 'agendamento.remarcado') {\n    const antes = d.inicio_em_antigo ? quando(d.inicio_em_antigo) : null;\n    template = 'agendamento_remarcado_barbeiro';\n    variaveis = {\n      profissional: prof.nome, cliente: cli.nome, servico: serv.nome,\n      data: t.data, hora: t.hora,\n      antes: antes ? `${antes.data} ${antes.hora}` : 'horario anterior',\n    };\n  } else if (ev.evento === 'agendamento.confirmado') {\n    template = 'agendamento_confirmado_barbeiro';\n    variaveis = {\n      profissional: prof.nome, cliente: cli.nome,\n      servico: serv.nome, data: t.data, hora: t.hora,\n    };\n  }\n\n  destino = canal === 'whatsapp' ? telProf : prof.email;\n\n  // Evento que nao tem mensagem associada, ou que nao tem para onde ir, e\n  // marcado como entregue de proposito: deixar ele na fila faria o poller\n  // tentar para sempre e o painel de 'eventos presos' encher de ruido, que e o\n  // que faz um painel de saude parar de ser olhado.\n  const entregavel = Boolean(template && destino);\n\n  saida.push({\n    json: {\n      evento_id: ev.id,\n      owner_id: ev.owner_id,\n      evento: ev.evento,\n      entregavel,\n      motivo_nao_entregavel: entregavel\n        ? null\n        : (!template ? 'evento sem mensagem para o barbeiro' : 'profissional sem telefone nem e-mail'),\n      canal,\n      destino,\n      template,\n      variaveis,\n      // A chave de dedupe descreve O QUE a mensagem e, nunca quando ela saiu.\n      // Com timestamp na chave, a reentrega geraria chave nova e o dedupe nao\n      // deduplicaria nada.\n      chave_dedupe: `${ev.evento}:${d.appointment_id}`,\n    },\n  });\n}\n\nreturn saida;"
+      },
+      "id": "2a000004-0000-4000-8000-000000000004",
+      "name": "Monta a mensagem",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-entregavel",
+              "leftValue": "={{ $json.entregavel }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2a000005-0000-4000-8000-000000000005",
+      "name": "Tem para quem mandar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [200, 0]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "06-enviar-mensagem",
+          "mode": "list",
+          "cachedResultName": "06 - Enviar mensagem"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "owner_id": "={{ $json.owner_id }}",
+            "canal": "={{ $json.canal }}",
+            "destino": "={{ $json.destino }}",
+            "template": "={{ $json.template }}",
+            "variaveis": "={{ JSON.stringify($json.variaveis) }}",
+            "chave_dedupe": "={{ $json.chave_dedupe }}"
+          },
+          "schema": []
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "2a000006-0000-4000-8000-000000000006",
+      "name": "Envia",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [400, -100]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select public.marcar_evento_entregue($1::uuid);",
+        "options": {
+          "queryReplacement": "={{ $('Monta a mensagem').item.json.evento_id }}"
+        }
+      },
+      "id": "2a000007-0000-4000-8000-000000000007",
+      "name": "Marca entregue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [600, -100],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "fastchair-postgres",
+          "name": "FastChair Supabase Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select public.marcar_evento_entregue($1::uuid);",
+        "options": {
+          "queryReplacement": "={{ $json.evento_id }}"
+        }
+      },
+      "id": "2a000008-0000-4000-8000-000000000008",
+      "name": "Encerra sem envio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [400, 120],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "id": "fastchair-postgres",
+          "name": "FastChair Supabase Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select public.marcar_evento_falhou($1::uuid, $2::text);",
+        "options": {
+          "queryReplacement": "={{ $('Monta a mensagem').item.json.evento_id }},={{ ($json.error && $json.error.message) || 'falha ao marcar entrega' }}"
+        }
+      },
+      "id": "2a000009-0000-4000-8000-000000000009",
+      "name": "Marca falha",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [600, 60],
+      "credentials": {
+        "postgres": {
+          "id": "fastchair-postgres",
+          "name": "FastChair Supabase Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "A cada minuto": {
+      "main": [[{ "node": "Reserva eventos", "type": "main", "index": 0 }]]
+    },
+    "Reserva eventos": {
+      "main": [[{ "node": "Um evento por vez", "type": "main", "index": 0 }]]
+    },
+    "Um evento por vez": {
+      "main": [
+        [],
+        [{ "node": "Monta a mensagem", "type": "main", "index": 0 }]
+      ]
+    },
+    "Monta a mensagem": {
+      "main": [[{ "node": "Tem para quem mandar?", "type": "main", "index": 0 }]]
+    },
+    "Tem para quem mandar?": {
+      "main": [
+        [{ "node": "Envia", "type": "main", "index": 0 }],
+        [{ "node": "Encerra sem envio", "type": "main", "index": 0 }]
+      ]
+    },
+    "Envia": {
+      "main": [[{ "node": "Marca entregue", "type": "main", "index": 0 }]]
+    },
+    "Marca entregue": {
+      "main": [
+        [{ "node": "Um evento por vez", "type": "main", "index": 0 }],
+        [{ "node": "Marca falha", "type": "main", "index": 0 }]
+      ]
+    },
+    "Encerra sem envio": {
+      "main": [[{ "node": "Um evento por vez", "type": "main", "index": 0 }]]
+    },
+    "Marca falha": {
+      "main": [[{ "node": "Um evento por vez", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "staticData": null,
+  "tags": [],
+  "meta": { "instanceId": "fastchair" }
+}

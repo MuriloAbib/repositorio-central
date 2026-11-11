@@ -1,0 +1,92 @@
+{
+  "name": "99 - Erro e fila morta",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "3c7f0001-0001-4c01-ab01-000000000001",
+      "name": "Falha de workflow",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-400, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const entrada = $input.first().json;\n\n// O Error Trigger entrega DOIS formatos: falha de execucao (chave `execution`) e falha de\n// gatilho ou de ativacao (chave `trigger`), e no segundo nao existe id de execucao. Ler so\n// um dos dois faz metade das falhas chegarem vazias na fila_morta, que e o mesmo que nao\n// ter alerta.\nconst execucao = entrada.execution || {};\nconst gatilho = entrada.trigger || {};\nconst fluxo = entrada.workflow || {};\nconst erro = execucao.error || gatilho.error || {};\n\nconst nome_do_fluxo = fluxo.name || 'desconhecido';\nconst mensagem = [erro.name, erro.message].filter(Boolean).join(': ') || 'falha sem detalhe';\nconst no_que_falhou = execucao.lastNodeExecuted || (erro.node && erro.node.name) || null;\n\nconst payload = {\n  workflow_id: fluxo.id || null,\n  workflow: nome_do_fluxo,\n  execucao_id: execucao.id || null,\n  execucao_url: execucao.url || null,\n  modo: execucao.mode || (entrada.trigger ? 'gatilho' : null),\n  retentativa_de: execucao.retryOf || null,\n  no_que_falhou: no_que_falhou,\n  // Cinco linhas de stack: o suficiente para achar o arquivo e a linha, pouco o bastante\n  // para a fila_morta nao virar deposito de log.\n  erro_stack: String(erro.stack || '').split('\\n').slice(0, 5).join('\\n')\n};\n\nconst texto = [\n  'Workflow: ' + nome_do_fluxo + ' (' + (fluxo.id || 'sem id') + ')',\n  'No que falhou: ' + (no_que_falhou || 'nao informado'),\n  'Execucao: ' + (execucao.id || 'nao informada'),\n  'Link: ' + (execucao.url || 'nao informado'),\n  '',\n  'Erro: ' + mensagem,\n  '',\n  'A falha foi gravada em public.fila_morta. Depois de resolver, marque revisado_em.'\n].join('\\n');\n\n// tenant_id fica nulo: a falha pode ocorrer antes de existir barbearia (webhook de\n// pagamento que nao normaliza), e a coluna e nulavel justamente por isso. Inventar dono\n// aqui esconderia a falha do inquilino certo.\nreturn [{ json: {\n  tenant_id: null,\n  origem: 'n8n:' + nome_do_fluxo,\n  evento: 'workflow.falhou',\n  erro: mensagem,\n  payload: payload,\n  assunto: '[FastChair] falha no workflow ' + nome_do_fluxo,\n  texto: texto\n} }];"
+      },
+      "id": "3c7f0001-0001-4c01-ab01-000000000002",
+      "name": "Monta a falha",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-200, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into public.fila_morta (tenant_id, origem, evento, payload, erro)\nvalues (nullif($1::text, '')::uuid, $2, $3, $4::jsonb, $5)\nreturning id, criado_em",
+        "options": {
+          "queryReplacement": "={{ $json.tenant_id || '' }},{{ $json.origem }},{{ $json.evento }},{{ JSON.stringify($json.payload) }},{{ $json.erro }}"
+        }
+      },
+      "id": "3c7f0001-0001-4c01-ab01-000000000003",
+      "name": "Grava na fila morta",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [0, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $env.EMAIL_REMETENTE }}",
+        "toEmail": "={{ $env.EMAIL_REMETENTE }}",
+        "subject": "={{ $('Monta a falha').first().json.assunto }}",
+        "emailFormat": "text",
+        "text": "={{ $('Monta a falha').first().json.texto }}\n\nfila_morta id: {{ $json.id }}",
+        "options": {}
+      },
+      "id": "3c7f0001-0001-4c01-ab01-000000000004",
+      "name": "Alerta por e-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [200, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "smtp": {
+          "name": "SMTP FastChair"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Falha de workflow": {
+      "main": [[{ "node": "Monta a falha", "type": "main", "index": 0 }]]
+    },
+    "Monta a falha": {
+      "main": [[{ "node": "Grava na fila morta", "type": "main", "index": 0 }]]
+    },
+    "Grava na fila morta": {
+      "main": [[{ "node": "Alerta por e-mail", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {},
+  "staticData": null,
+  "tags": [],
+  "meta": {
+    "instanceId": "fastchair"
+  }
+}

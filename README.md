@@ -19,3 +19,4 @@ espalhados em repositórios separados nesta conta.
 ## Formação
 
 - [Inovação, Sustentabilidade e Competitividade](inovacao-sustentabilidade-competitividade/) — atividades práticas, projeto final e referências da unidade curricular ISCE (RA 823219068).
+- [N8N para agendamentos](n8n-para-agendamentos/) — automação de atendimento do FastChair/BarberBook: webhook de pagamento que provisiona o usuário, aviso no WhatsApp do barbeiro a cada agendamento e régua de lembrete do cliente, orquestrados em n8n self-hosted sobre o Supabase.

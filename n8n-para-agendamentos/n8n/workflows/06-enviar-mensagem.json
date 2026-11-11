@@ -1,0 +1,424 @@
+{
+  "name": "06 - Enviar mensagem",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "enviar-mensagem",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000001",
+      "name": "Entrada de envio",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-800, 0],
+      "webhookId": "2b8e0001-0001-4b01-9b01-0000000000a1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n// require de modulo nativo no Code node exige NODE_FUNCTION_ALLOW_BUILTIN=crypto na\n// instancia. Falhar aqui e melhor que aceitar pedido de envio sem conferir quem pediu:\n// este endpoint manda mensagem no WhatsApp de cliente final.\n\nconst entrada = $input.first();\n\n// Header em minusculas: HTTP/2 entrega minuscula, HTTP/1.1 entrega como o remetente\n// escreveu, e 'X-Fastchair-Ts' !== 'x-fastchair-ts' num objeto JS.\nconst cab = {};\nfor (const [chave, valor] of Object.entries(entrada.json.headers || {})) {\n  cab[chave.toLowerCase()] = Array.isArray(valor) ? valor[0] : valor;\n}\n\n// Ponto de extensao declarado: a ESPECIFICACAO secao 8 nao permite o no\n// executeWorkflowTrigger, entao a entrada deste sub-workflow e um Webhook assinado e\n// quem chama usa HTTP Request. O pedido e lido dos dois formatos (corpo do webhook ou\n// item cru), de modo que liberar aquele tipo de no troca so o no de entrada.\nconst veio_de_webhook = Object.keys(cab).length > 0;\n\n// Os bytes exatos que chegaram, nao o objeto reserializado: JSON.stringify(JSON.parse(x))\n// difere de x em ordem de chave, espaco e escape unicode, e um byte derruba o HMAC.\nconst bruto = ((entrada.binary || {}).data || {}).data;\nconst cru = bruto === undefined ? null : Buffer.from(bruto, 'base64').toString('utf8');\n\nconst pedido = veio_de_webhook\n  ? (cru === null ? (entrada.json.body || {}) : JSON.parse(cru))\n  : (entrada.json || {});\n\nfunction iguais(a, b) {\n  // Tempo constante: com === a comparacao para no primeiro byte diferente e o tempo da\n  // resposta revela o prefixo correto da assinatura. O sha256 dos dois lados iguala o\n  // tamanho, que timingSafeEqual exige.\n  const da = crypto.createHash('sha256').update(String(a), 'utf8').digest();\n  const db = crypto.createHash('sha256').update(String(b), 'utf8').digest();\n  return crypto.timingSafeEqual(da, db);\n}\n\nif (veio_de_webhook) {\n  if (cru === null) throw new Error('corpo cru indisponivel, ligue o option rawBody no Webhook');\n  const segredo = $env.N8N_SEGREDO_ENTRADA;\n  if (!segredo) throw new Error('variavel de ambiente ausente: N8N_SEGREDO_ENTRADA');\n  const ts = String(cab['x-fastchair-ts'] || '');\n  const idade = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));\n  // Tolerancia de 300s: sem o ts dentro do texto assinado a requisicao capturada vale\n  // para sempre, porque o HMAC continua correto.\n  if (!Number.isFinite(idade) || idade > 300) throw new Error('timestamp fora da tolerancia de 300s');\n  const esperado = crypto.createHmac('sha256', segredo).update(ts + '.' + cru, 'utf8').digest('hex');\n  if (!iguais(esperado, cab['x-fastchair-assinatura'] || '')) throw new Error('assinatura da ponte invalida');\n}\n\nconst re_uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;\n\nconst tenant_id = String(pedido.tenant_id || '');\nif (!re_uuid.test(tenant_id)) throw new Error('tenant_id ausente ou invalido');\n\nconst canal = String(pedido.canal || '').toLowerCase();\nif (canal !== 'whatsapp' && canal !== 'email') throw new Error('canal invalido: ' + canal);\n\nlet destino = String(pedido.destino || '').trim();\nif (canal === 'whatsapp') {\n  destino = destino.replace(/\\D/g, '');\n  // Mesmo recorte do domain telefone_e164 de 0001-schema-base.sql. Falhar na borda e mais\n  // barato que falhar no CHECK dentro da transacao de reserva.\n  if (!/^[1-9][0-9]{7,14}$/.test(destino)) throw new Error('destino nao e E.164 sem +: ' + destino);\n} else if (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(destino)) {\n  throw new Error('destino nao e e-mail: ' + destino);\n}\n\nconst template = String(pedido.template || '').trim();\nif (!template) throw new Error('template obrigatorio');\n\nconst variaveis = (pedido.variaveis && typeof pedido.variaveis === 'object') ? pedido.variaveis : {};\nconst lembrete_id = re_uuid.test(String(pedido.lembrete_id || '')) ? String(pedido.lembrete_id) : null;\n\n// chave_dedupe e o que impede mensagem dobrada quando o chamador reentrega. Sem ela, o\n// padrao deriva de template + canal + destino + variaveis: duas mensagens iguais para o\n// mesmo destino sao exatamente a repeticao que se quer evitar, e duas diferentes nao\n// colidem na UNIQUE (tenant_id, chave_dedupe).\nconst chave_dedupe = String(pedido.chave_dedupe || '').trim()\n  || (template + ':' + canal + ':' + destino + ':'\n      + crypto.createHash('sha256').update(JSON.stringify(variaveis), 'utf8').digest('hex').slice(0, 16));\n\nreturn [{ json: {\n  tenant_id: tenant_id,\n  canal: canal,\n  destino: destino,\n  template: template,\n  variaveis: variaveis,\n  chave_dedupe: chave_dedupe,\n  lembrete_id: lembrete_id\n} }];"
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000002",
+      "name": "Valida pedido de envio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-600, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Reserva ANTES de enviar: e a linha existir antes da chamada ao canal que impede\n-- mensagem dobrada quando duas execucoes correm com a mesma chave. Conferir primeiro\n-- com SELECT perderia a corrida, porque as duas leriam vazio.\n-- O CHECK de status nao tem 'pendente', entao a reserva nasce 'falhou' e vira 'enviada'\n-- quando o canal confirma: morrer no meio deixa a linha dizendo o que a gente sabe de\n-- fato, que e que o envio nao foi confirmado.\ninsert into public.mensagens_enviadas\n  (tenant_id, chave_dedupe, canal, destino, template, variaveis, lembrete_id, status, erro)\nvalues\n  ($1::uuid, $2, $3, $4, $5, $6::jsonb, nullif($7::text, '')::uuid, 'falhou', 'reservado, envio ainda nao confirmado')\non conflict (tenant_id, chave_dedupe) do nothing\nreturning id, chave_dedupe",
+        "options": {
+          "queryReplacement": "={{ $json.tenant_id }},{{ $json.chave_dedupe }},{{ $json.canal }},{{ $json.destino }},{{ $json.template }},{{ JSON.stringify($json.variaveis) }},{{ $json.lembrete_id || '' }}"
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000003",
+      "name": "Reserva o envio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [-400, 0],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2b8e0002-0001-4b01-9b01-000000000004",
+              "leftValue": "={{ $json.id !== undefined && $json.id !== null }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000004",
+      "name": "Primeiro envio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-200, 0]
+    },
+    {
+      "parameters": {},
+      "id": "2b8e0001-0001-4b01-9b01-000000000005",
+      "name": "Envio duplicado",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [0, 220]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ enviado: false, duplicado: true, chave_dedupe: $('Valida pedido de envio').first().json.chave_dedupe }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000006",
+      "name": "Responde duplicado",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [200, 220]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\n\nconst pedido = $('Valida pedido de envio').first().json;\nconst reserva = $('Reserva o envio').first().json;\n\n// Isto NAO e evento do catalogo da secao 3: e chamada de funcao com efeito, e o envelope\n// existe para evento. A chave de idempotencia aqui e a mensagem ja reservada no banco\n// (mensagem_id) mais a chave_dedupe — e a Edge Function pode conferir as duas.\nconst corpo = {\n  mensagem_id: reserva.id,\n  tenant_id: pedido.tenant_id,\n  canal: pedido.canal,\n  destino: pedido.destino,\n  template: pedido.template,\n  variaveis: pedido.variaveis,\n  chave_dedupe: pedido.chave_dedupe,\n  lembrete_id: pedido.lembrete_id\n};\n\n// Uma serializacao so, e e ela que vai no corpo da requisicao (contentType raw no no\n// seguinte). Se o no de HTTP reserializasse o objeto, o HMAC seria sobre bytes diferentes\n// dos enviados e o backend recusaria toda chamada.\nconst corpo_bruto = JSON.stringify(corpo);\n\nconst segredo = $env.SEGREDO_PONTE;\nif (!segredo) throw new Error('variavel de ambiente ausente: SEGREDO_PONTE');\n\nconst ts = String(Math.floor(Date.now() / 1000));\nconst assinatura = crypto.createHmac('sha256', segredo).update(ts + '.' + corpo_bruto, 'utf8').digest('hex');\n\nreturn [{ json: { canal: pedido.canal, corpo_bruto: corpo_bruto, ts: ts, assinatura: assinatura } }];"
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000007",
+      "name": "Assina chamada da ponte",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, -60]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2b8e0002-0001-4b01-9b01-000000000081",
+                    "leftValue": "={{ $json.canal }}",
+                    "rightValue": "whatsapp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "whatsapp"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2b8e0002-0001-4b01-9b01-000000000082",
+                    "leftValue": "={{ $json.canal }}",
+                    "rightValue": "email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "email"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000008",
+      "name": "Qual canal?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [200, -60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/functions/v1/enviar-mensagem",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "x-fastchair-ts",
+              "value": "={{ $json.ts }}"
+            },
+            {
+              "name": "x-fastchair-assinatura",
+              "value": "={{ $json.assinatura }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.corpo_bruto }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000009",
+      "name": "Envia por WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [400, -240],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/functions/v1/enviar-mensagem",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}"
+            },
+            {
+              "name": "x-fastchair-ts",
+              "value": "={{ $json.ts }}"
+            },
+            {
+              "name": "x-fastchair-assinatura",
+              "value": "={{ $json.assinatura }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.corpo_bruto }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000010",
+      "name": "Envia por e-mail",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [400, -40],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "update public.mensagens_enviadas\n   set status = 'enviada',\n       provedor_mensagem_id = nullif($2::text, ''),\n       erro = null,\n       enviado_em = now()\n where id = $1::uuid\nreturning id, status, enviado_em",
+        "options": {
+          "queryReplacement": "={{ $('Reserva o envio').first().json.id }},{{ $json.provedor_mensagem_id || $json.mensagem_externa_id || '' }}"
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000011",
+      "name": "Grava envio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [600, -140],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ enviado: true, duplicado: false, mensagem_id: $json.id, status: $json.status, canal: $('Valida pedido de envio').first().json.canal }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000012",
+      "name": "Responde status",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [800, -140]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "update public.mensagens_enviadas\n   set status = 'falhou', erro = $2\n where id = $1::uuid\nreturning id",
+        "options": {
+          "queryReplacement": "={{ $('Reserva o envio').first().json.id }},{{ $json.error == null ? 'falha sem detalhe' : ($json.error.message || $json.error.description || String($json.error)) }}"
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000013",
+      "name": "Marca falha de envio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [600, 420],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into public.fila_morta (tenant_id, origem, evento, payload, erro)\nvalues (nullif($1::text, '')::uuid, $2, $3, $4::jsonb, $5)\nreturning id, criado_em",
+        "options": {
+          "queryReplacement": "={{ $('Valida pedido de envio').first().json.tenant_id }},{{ 'n8n:06-enviar-mensagem' }},{{ 'mensagem.envio' }},{{ JSON.stringify({ canal: $('Valida pedido de envio').first().json.canal, destino: $('Valida pedido de envio').first().json.destino, template: $('Valida pedido de envio').first().json.template, chave_dedupe: $('Valida pedido de envio').first().json.chave_dedupe, mensagem_id: $('Reserva o envio').first().json.id || null }) }},{{ $json.error == null ? 'envio falhou sem detalhe' : ($json.error.message || $json.error.description || String($json.error)) }}"
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000014",
+      "name": "Fila morta",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [800, 420],
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres FastChair"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ enviado: false, duplicado: false, fila_morta_id: $json.id || null, erro: 'envio esgotou o retry e foi para a fila morta' }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "2b8e0001-0001-4b01-9b01-000000000015",
+      "name": "Responde falha",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1000, 420]
+    }
+  ],
+  "connections": {
+    "Entrada de envio": {
+      "main": [[{ "node": "Valida pedido de envio", "type": "main", "index": 0 }]]
+    },
+    "Valida pedido de envio": {
+      "main": [[{ "node": "Reserva o envio", "type": "main", "index": 0 }]]
+    },
+    "Reserva o envio": {
+      "main": [
+        [{ "node": "Primeiro envio?", "type": "main", "index": 0 }],
+        [{ "node": "Fila morta", "type": "main", "index": 0 }]
+      ]
+    },
+    "Primeiro envio?": {
+      "main": [
+        [{ "node": "Assina chamada da ponte", "type": "main", "index": 0 }],
+        [{ "node": "Envio duplicado", "type": "main", "index": 0 }]
+      ]
+    },
+    "Envio duplicado": {
+      "main": [[{ "node": "Responde duplicado", "type": "main", "index": 0 }]]
+    },
+    "Assina chamada da ponte": {
+      "main": [[{ "node": "Qual canal?", "type": "main", "index": 0 }]]
+    },
+    "Qual canal?": {
+      "main": [
+        [{ "node": "Envia por WhatsApp", "type": "main", "index": 0 }],
+        [{ "node": "Envia por e-mail", "type": "main", "index": 0 }]
+      ]
+    },
+    "Envia por WhatsApp": {
+      "main": [
+        [{ "node": "Grava envio", "type": "main", "index": 0 }],
+        [{ "node": "Marca falha de envio", "type": "main", "index": 0 }]
+      ]
+    },
+    "Envia por e-mail": {
+      "main": [
+        [{ "node": "Grava envio", "type": "main", "index": 0 }],
+        [{ "node": "Marca falha de envio", "type": "main", "index": 0 }]
+      ]
+    },
+    "Grava envio": {
+      "main": [[{ "node": "Responde status", "type": "main", "index": 0 }]]
+    },
+    "Marca falha de envio": {
+      "main": [[{ "node": "Fila morta", "type": "main", "index": 0 }]]
+    },
+    "Fila morta": {
+      "main": [[{ "node": "Responde falha", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all"
+  },
+  "pinData": {},
+  "staticData": null,
+  "tags": [],
+  "meta": {
+    "instanceId": "fastchair"
+  }
+}
