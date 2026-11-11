@@ -1,0 +1,240 @@
+{
+  "name": "Captur8 — lead do formulario para a planilha",
+  "nodes": [
+    {
+      "parameters": {
+        "width": 420,
+        "height": 420,
+        "color": 4,
+        "content": "## Captur8\n**Entrada:** POST no webhook `/captur8` (JSON do formulario).\n**Saida:** uma linha na planilha + resposta JSON pra quem chamou.\n\nFluxo: Webhook -> normaliza -> valida -> grava -> responde.\n\n### Antes de ativar\n1. Credencial `Google Sheets OAuth2` configurada.\n2. `documentId` do no de planilha trocado pelo ID da sua.\n3. Cabecalho da planilha na linha 1, nesta ordem:\n   recebido_em | nome | email | telefone | tipo_telefone | origem | mensagem\n\n### Por que \"Respond to Webhook\"\nO webhook esta em `responseMode: responseNode`: quem chamou fica\nesperando ate o fluxo decidir o que responder (200 ou 400)."
+      },
+      "id": "A",
+      "name": "Leia-me A",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -620,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "captur8",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Entrada do Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -140,
+        20
+      ],
+      "webhookId": "captur8-webhook-id"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Captur8 — normaliza o payload cru do formulario antes de gravar.\n// Modo do no: \"Run Once for All Items\".\n\nconst soDigitos = (texto) => String(texto ?? '').replace(/D/g, '');\n\n// Telefone BR: 10 digitos NAO significa fixo. Antes do nono digito o celular\n// tinha 8 digitos e comecava em 6, 7, 8 ou 9 (fixo comeca em 2 a 5).\n// Classificar antes de descartar: a regra ingenua joga fora numero bom.\nfunction normalizarTelefone(bruto) {\n  let d = soDigitos(bruto);\n  if (d.startsWith('55') && d.length > 11) d = d.slice(2);\n  if (d.length < 10) return { telefone: d, tipo: 'invalido' };\n\n  const ddd = d.slice(0, 2);\n  const assinante = d.slice(2);\n\n  if (Number(ddd) < 11) return { telefone: d, tipo: 'invalido' };\n  if (assinante.length === 8 && /^[6-9]/.test(assinante)) {\n    return { telefone: ddd + '9' + assinante, tipo: 'celular' };   // formato antigo\n  }\n  if (assinante.length === 8) return { telefone: d, tipo: 'fixo' }; // fixo tem WhatsApp\n  if (assinante.length === 9) return { telefone: d, tipo: 'celular' };\n  return { telefone: d, tipo: 'invalido' };\n}\n\nconst saida = [];\n\nfor (const item of $input.all()) {\n  // No no Webhook, o que o cliente mandou chega dentro de \"body\".\n  const corpo = item.json.body ?? item.json;\n  const { telefone, tipo } = normalizarTelefone(corpo.telefone ?? corpo.phone);\n  const email = String(corpo.email ?? '').trim().toLowerCase();\n\n  saida.push({\n    json: {\n      nome: String(corpo.nome ?? corpo.name ?? '').trim(),\n      email,\n      telefone,\n      tipo_telefone: tipo,\n      origem: corpo.origem ?? corpo.utm_source ?? 'desconhecida',\n      mensagem: String(corpo.mensagem ?? '').trim(),\n      recebido_em: new Date().toISOString(),\n      // Chave de idempotencia: se o formulario disparar duas vezes, da pra\n      // reconhecer o duplicado depois sem depender do horario.\n      chave: (email || telefone || 'sem-chave'),\n    },\n  });\n}\n\nreturn saida;"
+      },
+      "id": "normalizar",
+      "name": "Normalizar Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.email }}",
+              "rightValue": "^[^@s]+@[^@s]+.[a-z]{2,}$",
+              "operator": {
+                "type": "string",
+                "operation": "regex"
+              }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.nome }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      },
+      "id": "valida",
+      "name": "Lead valido?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "TROQUE_PELO_ID_DA_SUA_PLANILHA",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Leads"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "recebido_em": "={{ $json.recebido_em }}",
+            "nome": "={{ $json.nome }}",
+            "email": "={{ $json.email }}",
+            "telefone": "={{ $json.telefone }}",
+            "tipo_telefone": "={{ $json.tipo_telefone }}",
+            "origem": "={{ $json.origem }}",
+            "mensagem": "={{ $json.mensagem }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "planilha",
+      "name": "Gravar na Planilha",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        600,
+        -80
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "TROQUE_PELA_SUA_CREDENCIAL",
+          "name": "Google Sheets — Captur8"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": true, \"mensagem\": \"Lead recebido\", \"lead\": { \"nome\": $('Normalizar Lead').item.json.nome, \"email\": $('Normalizar Lead').item.json.email, \"telefone\": $('Normalizar Lead').item.json.telefone } } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ok",
+      "name": "Responder 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        840,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": false, \"erro\": \"nome ou email invalido\", \"recebido\": { \"nome\": $json.nome, \"email\": $json.email } } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "erro",
+      "name": "Responder 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        600,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Entrada do Lead": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Lead": {
+      "main": [
+        [
+          {
+            "node": "Lead valido?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead valido?": {
+      "main": [
+        [
+          {
+            "node": "Gravar na Planilha",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar na Planilha": {
+      "main": [
+        [
+          {
+            "node": "Responder 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "autom8-lab"
+    }
+  ]
+}

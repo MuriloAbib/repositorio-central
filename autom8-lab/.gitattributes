@@ -1,0 +1,4 @@
+# Script de teste roda em Linux/Mac: CRLF quebraria o shebang.
+*.sh text eol=lf
+*.json text eol=lf
+*.md text eol=lf

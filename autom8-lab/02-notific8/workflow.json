@@ -1,0 +1,257 @@
+{
+  "name": "Notific8 — vigia do site com alerta no Telegram",
+  "nodes": [
+    {
+      "parameters": {
+        "width": 420,
+        "height": 480,
+        "color": 3,
+        "content": "## Notific8\n**Entrada:** ninguem chama. O `Schedule Trigger` dispara de 5 em 5 minutos.\n**Saida:** mensagem no Telegram quando o site cai e quando volta.\n\nFluxo: relogio -> configuracao -> bate no site -> decide -> avisa.\n\n### Antes de ativar\n1. Trocar `url` e `texto_esperado` no no **Configuracao**.\n2. Criar o bot no `@BotFather`, pegar o token, criar a credencial\n   `Telegram API` no n8n.\n3. Mandar uma mensagem pro bot e pegar o `chat_id` em\n   `api.telegram.org/bot<TOKEN>/getUpdates`.\n\n### O detalhe que importa\nO no HTTP esta com **Never Error** ligado: site caido tem que virar\n`statusCode` pra ser avaliado, nao execucao vermelha. Sem isso o fluxo\nmorre antes de conseguir avisar que morreu."
+      },
+      "id": "A",
+      "name": "Leia-me A",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -760,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "relogio",
+      "name": "A cada 5 minutos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -300,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "url",
+              "value": "https://exemplo.com.br",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "texto_esperado",
+              "value": "Agendar",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "conf",
+      "name": "Configuracao",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -80,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "timeout": 10000,
+          "redirect": {
+            "redirect": {}
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "bater",
+      "name": "Bater no site",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        160,
+        40
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Notific8 — decide se o alerta sai, e evita flood.\n//\n// Duas perguntas:\n//   1) o site esta ruim? (codigo de erro OU pagina sem o texto esperado)\n//   2) ja avisei isso? (estado guardado entre execucoes)\n//\n// O estado vive em $getWorkflowStaticData('global'): e um objeto que o n8n\n// grava junto do workflow e devolve na execucao seguinte. Sem ele, um site\n// caido geraria 12 mensagens por hora.\n\nconst REPETIR_APOS_MIN = 60;   // enquanto durar, relembra de hora em hora\n\nconst conf = $('Configuracao').first().json;\nconst r = $input.first().json;\nconst estado = $getWorkflowStaticData('global');\n\nconst codigo = Number(r.statusCode ?? 0);\nconst corpo = typeof r.body === 'string' ? r.body : JSON.stringify(r.body ?? '');\n\nlet problema = null;\nif (codigo === 0) problema = 'sem resposta (timeout ou DNS)';\nelse if (codigo >= 400) problema = 'HTTP ' + codigo;\nelse if (conf.texto_esperado && !corpo.includes(conf.texto_esperado)) {\n  // Armadilha classica: o servidor responde 200 e entrega pagina de erro.\n  problema = 'respondeu 200 sem \"' + conf.texto_esperado + '\" na pagina';\n}\n\nconst agora = Date.now();\nconst estavaRuim = Boolean(estado.problema);\nconst minutosDesdeAviso = (agora - Number(estado.ultimo_aviso ?? 0)) / 60000;\n\nlet alertar = false;\nlet assunto = '';\n\nif (problema && !estavaRuim) {\n  alertar = true; assunto = 'CAIU';                    // virada bom -> ruim\n} else if (problema && minutosDesdeAviso >= REPETIR_APOS_MIN) {\n  alertar = true; assunto = 'AINDA CAIDO';             // lembrete de hora em hora\n} else if (!problema && estavaRuim) {\n  alertar = true; assunto = 'VOLTOU';                  // virada ruim -> bom\n}\n\nif (alertar) estado.ultimo_aviso = agora;\nestado.problema = problema;   // null quando esta tudo bem\n\nreturn [{\n  json: {\n    alertar,\n    assunto,\n    problema: problema ?? 'nenhum',\n    codigo,\n    url: conf.url,\n    verificado_em: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),\n  },\n}];"
+      },
+      "id": "decidir",
+      "name": "Decidir se alerta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.alertar }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      },
+      "id": "deve",
+      "name": "Deve alertar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "TROQUE_PELO_SEU_CHAT_ID",
+        "text": "={{ \"<b>\" + $json.assunto + \"</b>\n\" + $json.url + \"\nMotivo: \" + $json.problema + \"\nQuando: \" + $json.verificado_em }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "telegram",
+      "name": "Avisar no Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        900,
+        -60
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "TROQUE_PELA_SUA_CREDENCIAL",
+          "name": "Telegram Bot — Notific8"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {},
+      "id": "nada",
+      "name": "Nada a fazer",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        900,
+        140
+      ]
+    }
+  ],
+  "connections": {
+    "A cada 5 minutos": {
+      "main": [
+        [
+          {
+            "node": "Configuracao",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuracao": {
+      "main": [
+        [
+          {
+            "node": "Bater no site",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bater no site": {
+      "main": [
+        [
+          {
+            "node": "Decidir se alerta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decidir se alerta": {
+      "main": [
+        [
+          {
+            "node": "Deve alertar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deve alertar?": {
+      "main": [
+        [
+          {
+            "node": "Avisar no Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nada a fazer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "autom8-lab"
+    }
+  ]
+}

@@ -1,0 +1,470 @@
+{
+  "name": "Valid8 — pedido validado e enriquecido pelo CEP",
+  "nodes": [
+    {
+      "parameters": {
+        "width": 440,
+        "height": 520,
+        "color": 5,
+        "content": "## Valid8\n**Entrada:** POST no webhook `/valid8` com cliente, cep e itens.\n**Saida:** JSON com endereco completo, subtotal, frete e prazo.\n\nFluxo: webhook -> valida -> consulta ViaCEP -> junta -> roteia frete -> responde.\n\n### Nao precisa de credencial\nA ViaCEP e publica. Esse e o projeto pra entender **enriquecimento de\ndados**: o cliente manda 8 digitos, voce devolve rua, bairro, cidade e UF.\n\n### Os tres truques daqui\n1. **Validar antes de chamar a API.** CEP torto nao vira requisicao.\n2. **$('nome do no')** recupera dado de um no anterior — o pedido nao\n   se perde na passagem pela chamada HTTP.\n3. **Saida de sobra do Switch** (fallback): e onde cai o que nao casou com\n   regra nenhuma. Aqui, CEP que nao existe."
+      },
+      "id": "A",
+      "name": "Leia-me A",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "valid8",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Pedido chega",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        40
+      ],
+      "webhookId": "valid8-webhook-id"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Valid8 — le o pedido cru e decide se da pra seguir.\n// Validar ANTES de chamar a API externa: nao se gasta requisicao com lixo.\n\nconst corpo = $input.first().json.body ?? $input.first().json;\n\nconst cep = String(corpo.cep ?? '').replace(/\\D/g, '');\nconst itens = Array.isArray(corpo.itens) ? corpo.itens : [];\n\nconst itensLimpos = itens\n  .map((i) => ({\n    sku: String(i.sku ?? '').trim(),\n    nome: String(i.nome ?? '').trim(),\n    qtd: Number(i.qtd ?? 0),\n    preco: Number(i.preco ?? 0),\n  }))\n  .filter((i) => i.sku && i.qtd > 0 && i.preco > 0);\n\nconst subtotal = Number(\n  itensLimpos.reduce((soma, i) => soma + i.qtd * i.preco, 0).toFixed(2)\n);\n\nconst motivos = [];\nif (cep.length !== 8) motivos.push('cep precisa de 8 digitos');\nif (itensLimpos.length === 0) motivos.push('pedido sem item valido');\n\nreturn [{\n  json: {\n    valido: motivos.length === 0,\n    motivo: motivos.join('; ') || null,\n    cliente: String(corpo.cliente ?? '').trim(),\n    cep,\n    itens: itensLimpos,\n    subtotal,\n  },\n}];"
+      },
+      "id": "ler",
+      "name": "Ler e validar o pedido",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.valido }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": false,
+        "options": {}
+      },
+      "id": "if",
+      "name": "Pedido valido?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        80,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://viacep.com.br/ws/{{ $json.cep }}/json/",
+        "options": {
+          "timeout": 8000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "viacep",
+      "name": "Consultar ViaCEP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        -60
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Valid8 — junta o pedido com o endereco que a API devolveu.\n//\n// $('Ler e validar o pedido') alcanca a saida de um no anterior: o pedido\n// nao se perde so porque o no do meio foi uma chamada HTTP.\n//\n// A ViaCEP nao devolve 404 pra CEP inexistente: devolve 200 com { erro: true }.\n// Por isso a checagem e no corpo, nao no codigo de status.\n\nconst pedido = $('Ler e validar o pedido').first().json;\nconst cepInfo = $input.first().json;\n\nconst naoEncontrado =\n  cepInfo.erro === true || String(cepInfo.erro) === 'true' || !cepInfo.uf;\n\nconst SUDESTE_SUL = ['SP', 'RJ', 'MG', 'ES', 'PR', 'SC', 'RS'];\n\nlet regiao = 'nao_encontrado';\nif (!naoEncontrado) regiao = SUDESTE_SUL.includes(cepInfo.uf) ? 'sudeste_sul' : 'demais';\n\nreturn [{\n  json: {\n    ...pedido,\n    regiao,\n    endereco: naoEncontrado\n      ? null\n      : {\n          cep: cepInfo.cep,\n          logradouro: cepInfo.logradouro,\n          bairro: cepInfo.bairro,\n          cidade: cepInfo.localidade,\n          uf: cepInfo.uf,\n        },\n  },\n}];"
+      },
+      "id": "montar",
+      "name": "Montar orcamento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "s1",
+                    "leftValue": "={{ $json.regiao }}",
+                    "rightValue": "sudeste_sul",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sudeste_sul"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "s2",
+                    "leftValue": "={{ $json.regiao }}",
+                    "rightValue": "demais",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "demais"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "cep_nao_encontrado"
+        }
+      },
+      "id": "switch",
+      "name": "Faixa de frete",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        760,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "frete",
+              "value": "={{ $json.subtotal >= 299 ? 0 : 29.9 }}",
+              "type": "number"
+            },
+            {
+              "id": "f2",
+              "name": "prazo_dias_uteis",
+              "value": "={{ 4 }}",
+              "type": "number"
+            },
+            {
+              "id": "f3",
+              "name": "aviso",
+              "value": "={{ $json.subtotal >= 299 ? \"frete gratis acima de R$ 299\" : \"\" }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "f1",
+      "name": "Frete Sudeste e Sul",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1000,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "frete",
+              "value": "={{ $json.subtotal >= 499 ? 0 : 54.9 }}",
+              "type": "number"
+            },
+            {
+              "id": "f2",
+              "name": "prazo_dias_uteis",
+              "value": "={{ 8 }}",
+              "type": "number"
+            },
+            {
+              "id": "f3",
+              "name": "aviso",
+              "value": "={{ $json.subtotal >= 499 ? \"frete gratis acima de R$ 499\" : \"\" }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "f2",
+      "name": "Frete demais regioes",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1000,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "frete",
+              "value": "={{ 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "f2",
+              "name": "prazo_dias_uteis",
+              "value": "={{ 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "f3",
+              "name": "aviso",
+              "value": "CEP nao localizado na base dos Correios: frete a combinar",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "f3",
+      "name": "CEP nao encontrado",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1000,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": true, \"cliente\": $json.cliente, \"endereco\": $json.endereco, \"itens\": $json.itens, \"subtotal\": $json.subtotal, \"frete\": $json.frete, \"total\": $json.subtotal + $json.frete, \"prazo_dias_uteis\": $json.prazo_dias_uteis, \"aviso\": $json.aviso } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ok",
+      "name": "Responder 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1260,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"ok\": false, \"erro\": $json.motivo } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "ruim",
+      "name": "Responder 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        320,
+        180
+      ]
+    }
+  ],
+  "connections": {
+    "Pedido chega": {
+      "main": [
+        [
+          {
+            "node": "Ler e validar o pedido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler e validar o pedido": {
+      "main": [
+        [
+          {
+            "node": "Pedido valido?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pedido valido?": {
+      "main": [
+        [
+          {
+            "node": "Consultar ViaCEP",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consultar ViaCEP": {
+      "main": [
+        [
+          {
+            "node": "Montar orcamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar orcamento": {
+      "main": [
+        [
+          {
+            "node": "Faixa de frete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Faixa de frete": {
+      "main": [
+        [
+          {
+            "node": "Frete Sudeste e Sul",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Frete demais regioes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CEP nao encontrado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Frete Sudeste e Sul": {
+      "main": [
+        [
+          {
+            "node": "Responder 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Frete demais regioes": {
+      "main": [
+        [
+          {
+            "node": "Responder 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CEP nao encontrado": {
+      "main": [
+        [
+          {
+            "node": "Responder 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "autom8-lab"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+# Nada de segredo neste repositorio.
+.env
+.env.*
+*.token
+credenciais*.json
+
+# Export de credencial do n8n (NUNCA versionar: vem com token em claro)
+credentials*.json
+n8n-credentials*.json
+
+# Banco local do n8n, se alguem rodar dentro da pasta
+.n8n/
+database.sqlite
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store
