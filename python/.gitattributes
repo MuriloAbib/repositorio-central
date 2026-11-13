@@ -1,0 +1,3 @@
+# Codigo e doc em LF, para o arquivo ficar igual no Windows, no Linux e no GitHub.
+*.py text eol=lf
+*.md text eol=lf
