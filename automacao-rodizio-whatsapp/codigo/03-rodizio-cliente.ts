@@ -30,7 +30,7 @@ export const DEFAULT_PROPOSTA_MESSAGE =
 // O elenco da fila.
 // -----------------------------------------------------------------------------
 // whatsappNumber e whatsappDisplay são campos SEPARADOS de propósito. O humano
-// precisa ler "+55 21 98215-4293"; a URL precisa de "5521982154293". Derivar um
+// precisa ler "+55 11 90000-0001"; a URL precisa de "5511900000001". Derivar um
 // do outro na hora de renderizar é onde nasce o link quebrado — alguém esquece
 // o DDI, ou deixa o hífen passar para dentro do wa.me/.
 //
